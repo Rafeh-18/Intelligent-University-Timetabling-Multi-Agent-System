@@ -176,4 +176,4 @@ scikit-learn
 
 ## 📄 License
 
-This project is developed as part of a university course on **Cooperative and Collaborative AI**. For academic use only.
+This project is developed as part of a university course on **Distributed and Collaborative AI 2025-2026**. For academic use only.
