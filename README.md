@@ -71,7 +71,7 @@ Schedule       (session_id, course_id, room_id, day, time_slot)
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/your-username/timetabling-mas.git
+git clone https://github.com/Rafeh-18/Intelligent-University-Timetabling-Multi-Agent-System.git
 cd timetabling-mas
 ```
 
