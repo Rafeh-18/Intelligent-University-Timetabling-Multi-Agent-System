@@ -158,7 +158,7 @@ def insert_session(course_id, room_id, day, time_slot):
     session_id = cursor.lastrowid
     conn.close()
     print(f"[DB] Session inserted: id={session_id}, course={course_id}, day={day}, slot={time_slot}")
-    return 
+    return session_id
 
 def get_all_teachers():
     """Retrieves every teacher record and turns them into a Python list of dictionaries."""
