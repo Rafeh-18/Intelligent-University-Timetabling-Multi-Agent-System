@@ -1,61 +1,80 @@
 """
-preference_model.py - ML Teacher Preference Prediction (scikit-learn)
+preference_model.py - ML Teacher Preference Prediction
 
-Trains a RandomForestClassifier per teacher to predict which time slot
-they are most likely to accept, based on historical scheduling data.
+Trains one RandomForestClassifier per teacher to predict which (day, slot)
+the teacher is most likely to accept, based on historical scheduling data.
 
-When no historical data exists (first run), the model falls back to
-the teacher's declared preferred_time from the database.
+When no historical data exists (first run), falls back to the heuristic
+day/slot scores defined in config.py.
 
-Features used
--------------
-- day_encoded        : integer encoding of day (Mon=0 … Fri=4)
-- slot_index         : integer index of time slot (0–4)
-- course_type        : integer encoding of required_room_type
-- group_size         : integer (student count)
-- already_booked_day : how many sessions the teacher already has that day
+Features
+--------
+day_encoded        int   Monday=0 … Saturday=5
+slot_index         int   index into TIME_SLOTS
+course_type_int    int   Standard=0, Lab=1, Lecture Hall=2
+group_size         int
+already_booked_day int   how many sessions the teacher already has that day
 
 Label
 -----
-- accepted : 1 if the teacher was assigned this slot historically, 0 otherwise
+accepted  1 = slot was assigned historically, 0 = rejected/skipped
+
+History persistence
+-------------------
+Stored as JSON at HISTORY_FILE (config.py). Each teacher has a key equal to
+their teacher_id (as a string). History is seeded once per teacher and never
+duplicated on subsequent runs (idempotent).
 """
 
-import os
+from __future__ import annotations
+
 import json
-import numpy as np
+import random
+from pathlib import Path
+from typing import Optional
+
+from config import (
+    DAYS,
+    TIME_SLOTS,
+    HISTORY_FILE,
+    ML_CFG,
+    HEURISTIC_DAY_SCORES,
+    HEURISTIC_SLOT_SCORES,
+)
 
 try:
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.preprocessing import LabelEncoder
     from sklearn.model_selection import train_test_split
+    import numpy as np
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
-    print("[PreferenceModel] scikit-learn not installed — using rule-based fallback.")
-
-from utils import DAYS, TIME_SLOTS
-
-# Where we persist training data between runs
-HISTORY_FILE = "preference_history.json"
+    print("[PreferenceModel] scikit-learn not installed — using heuristic fallback.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature engineering
+# Feature encoding
 # ─────────────────────────────────────────────────────────────────────────────
 
-ROOM_TYPE_MAP = {"Standard": 0, "Lab": 1, "Lecture Hall": 2}
+_ROOM_TYPE_ENCODING = {"Standard": 0, "Lab": 1, "Lecture Hall": 2}
 
-def encode_features(day, time_slot, course, group_size, booked_today):
+
+def encode_features(
+    day: str,
+    time_slot: str,
+    course: dict,
+    group_size: int,
+    booked_today: int,
+) -> list[float]:
     """
     Convert a scheduling proposal into a numeric feature vector.
-
-    Returns
-    -------
-    list[int | float]  [day_idx, slot_idx, room_type_int, group_size, booked_today]
+    Returns [day_idx, slot_idx, room_type_int, group_size, booked_today].
     """
-    day_idx       = DAYS.index(day) if day in DAYS else 0
+    day_idx       = DAYS.index(day)       if day       in DAYS       else 0
     slot_idx      = TIME_SLOTS.index(time_slot) if time_slot in TIME_SLOTS else 0
-    room_type_int = ROOM_TYPE_MAP.get(course.get("required_room_type", "Standard"), 0)
+    room_type_int = _ROOM_TYPE_ENCODING.get(
+        course.get("required_room_type", "Standard"), 0
+    )
     return [day_idx, slot_idx, room_type_int, group_size, booked_today]
 
 
@@ -63,37 +82,49 @@ def encode_features(day, time_slot, course, group_size, booked_today):
 # History persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_history():
+def load_history() -> dict:
     """
-    Load historical scheduling decisions from HISTORY_FILE.
-    Returns dict { teacher_id(str) -> list[dict] }
+    Load teacher preference history from HISTORY_FILE.
+    Returns dict { teacher_id_str -> list[record_dict] }.
     """
-    if not os.path.exists(HISTORY_FILE):
+    path = Path(HISTORY_FILE)
+    if not path.exists():
         return {}
-    with open(HISTORY_FILE, "r") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[PreferenceModel] Warning: could not read history file: {exc}")
+        return {}
 
 
-def save_history(history):
+def save_history(history: dict) -> None:
     """Persist history dict to HISTORY_FILE."""
-    with open(HISTORY_FILE, "w") as f:
+    path = Path(HISTORY_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
 
-def record_assignment(teacher_id, day, time_slot, course, group_size, booked_today, accepted=1):
+def record_assignment(
+    teacher_id: int,
+    day: str,
+    time_slot: str,
+    course: dict,
+    group_size: int,
+    booked_today: int,
+    accepted: int = 1,
+) -> None:
     """
-    Record a scheduling outcome to the history file.
+    Append a single scheduling outcome to the history file.
 
     Parameters
     ----------
-    accepted : int  1 = slot was assigned, 0 = slot was rejected/skipped
+    accepted : 1 = assigned, 0 = rejected/skipped
     """
     history = load_history()
     key     = str(teacher_id)
-    if key not in history:
-        history[key] = []
-
-    history[key].append({
+    history.setdefault(key, []).append({
         "day":          day,
         "time_slot":    time_slot,
         "course_type":  course.get("required_room_type", "Standard"),
@@ -101,12 +132,80 @@ def record_assignment(teacher_id, day, time_slot, course, group_size, booked_tod
         "booked_today": booked_today,
         "accepted":     accepted,
     })
-
     save_history(history)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PreferenceModel class
+# Synthetic history seeding (idempotent)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def seed_synthetic_history(
+    teachers: list[dict],
+    num_records: int = ML_CFG.SEED_RECORDS_PER_TEACHER,
+    force: bool = False,
+) -> None:
+    """
+    Generate synthetic scheduling history for teachers that have no records.
+
+    Idempotent: calling this multiple times does NOT append duplicate data.
+    Each teacher gets exactly `num_records` records, generated deterministically
+    from their teacher_id as the random seed.
+
+    Parameters
+    ----------
+    teachers   : list of teacher dicts from the database
+    num_records: records to generate per teacher (default from ML_CFG)
+    force      : if True, overwrite existing records for all teachers
+    """
+    history = load_history()
+    newly_seeded = 0
+
+    for t in teachers:
+        key = str(t["teacher_id"])
+
+        # Skip if already has enough records (and not forcing)
+        if not force and key in history and len(history[key]) >= num_records:
+            continue
+
+        rng    = random.Random(t["teacher_id"])   # deterministic per teacher
+        avail  = [d.strip() for d in t["available_days"].split(",")]
+        pref   = t["preferred_time"]
+        pref_slots  = TIME_SLOTS[:3] if pref == "Morning" else TIME_SLOTS[2:]
+        other_slots = [s for s in TIME_SLOTS if s not in pref_slots]
+
+        records: list[dict] = []
+        for _ in range(num_records):
+            day  = rng.choice(avail)
+            slot = (
+                rng.choice(pref_slots)
+                if rng.random() < ML_CFG.PREFERRED_SLOT_PROBABILITY
+                else rng.choice(other_slots)
+            )
+            accepted = (
+                1 if slot in pref_slots
+                else int(rng.random() < ML_CFG.NON_PREFERRED_ACCEPT_RATE)
+            )
+            records.append({
+                "day":          day,
+                "time_slot":    slot,
+                "course_type":  rng.choice(["Standard", "Lab", "Lecture Hall"]),
+                "group_size":   rng.randint(16, 32),
+                "booked_today": rng.randint(0, 2),
+                "accepted":     accepted,
+            })
+
+        history[key] = records
+        newly_seeded += 1
+
+    if newly_seeded:
+        save_history(history)
+        print(f"[PreferenceModel] Seeded history for {newly_seeded} teacher(s).")
+    else:
+        print("[PreferenceModel] All teachers already have history — skipping seed.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PreferenceModel
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PreferenceModel:
@@ -116,229 +215,163 @@ class PreferenceModel:
     Usage
     -----
     pm = PreferenceModel()
-    pm.train()                          # train on all available history
-    slots = pm.rank_slots(teacher, course, group_size, booked_per_day)
+    pm.train()
+    ranked = pm.rank_slots(teacher_agent, course, group_size, booked_per_day)
+
+    Observability
+    -------------
+    After training, `trained_teacher_ids` contains the IDs of teachers
+    for which an ML model was successfully fitted. All others use the
+    heuristic fallback, which is logged during prediction.
     """
 
     def __init__(self):
-        self._models   = {}   # { teacher_id -> fitted RandomForestClassifier }
-        self._trained  = False
-        self._history  = {}
+        self._models: dict[str, "RandomForestClassifier"] = {}
+        self.trained_teacher_ids: set[str] = set()
 
-    def train(self):
+    def train(self) -> None:
         """
-        Train one RandomForestClassifier per teacher using history.
-        Falls back gracefully if a teacher has insufficient data (<4 records).
+        Train one RandomForestClassifier per teacher using stored history.
+        Teachers with fewer than ML_CFG.MIN_RECORDS_TO_TRAIN records are
+        skipped (heuristic fallback will be used for them).
         """
         if not SKLEARN_AVAILABLE:
-            print("[PreferenceModel] Skipping training — scikit-learn unavailable.")
+            print("[PreferenceModel] Cannot train — scikit-learn unavailable.")
             return
 
-        self._history = load_history()
-        trained_count = 0
+        history = load_history()
+        trained = 0
+        skipped = 0
 
-        for teacher_id, records in self._history.items():
-            if len(records) < 4:
-                # Not enough data to train — will use rule-based fallback
+        for teacher_id, records in history.items():
+            if len(records) < ML_CFG.MIN_RECORDS_TO_TRAIN:
+                skipped += 1
                 continue
 
-            X, y = [], []
+            X = []
+            y = []
             for r in records:
-                booked = r.get("booked_today", 0)
                 course_stub = {"required_room_type": r.get("course_type", "Standard")}
-                features = encode_features(
+                X.append(encode_features(
                     r["day"], r["time_slot"], course_stub,
-                    r["group_size"], booked
-                )
-                X.append(features)
+                    r["group_size"], r.get("booked_today", 0),
+                ))
                 y.append(r["accepted"])
 
-            X = np.array(X)
-            y = np.array(y)
+            X_arr = np.array(X)
+            y_arr = np.array(y)
 
             # Need at least two classes to train a classifier
-            if len(set(y)) < 2:
+            if len(set(y_arr)) < 2:
+                skipped += 1
                 continue
 
             clf = RandomForestClassifier(
-                n_estimators=40,
-                max_depth=4,
-                random_state=42,
+                n_estimators=ML_CFG.N_ESTIMATORS,
+                max_depth=ML_CFG.MAX_DEPTH,
+                random_state=ML_CFG.RANDOM_STATE,
                 class_weight="balanced",
             )
 
-            # Only split if we have enough samples
-            if len(X) >= 8:
+            if len(X_arr) >= ML_CFG.VAL_SPLIT_THRESHOLD:
                 X_tr, X_val, y_tr, y_val = train_test_split(
-                    X, y, test_size=0.25, random_state=42, stratify=y
+                    X_arr, y_arr,
+                    test_size=ML_CFG.VAL_SPLIT_RATIO,
+                    random_state=ML_CFG.RANDOM_STATE,
+                    stratify=y_arr,
                 )
                 clf.fit(X_tr, y_tr)
                 acc = clf.score(X_val, y_val)
                 print(
                     f"  [PreferenceModel] Teacher {teacher_id}: "
-                    f"trained on {len(X_tr)} samples, val acc={acc:.2f}"
+                    f"n={len(X_tr)} val_acc={acc:.2f}"
                 )
             else:
-                clf.fit(X, y)
+                clf.fit(X_arr, y_arr)
                 print(
                     f"  [PreferenceModel] Teacher {teacher_id}: "
-                    f"trained on {len(X)} samples (no val split)"
+                    f"n={len(X_arr)} (no val split)"
                 )
 
             self._models[teacher_id] = clf
-            trained_count += 1
+            self.trained_teacher_ids.add(teacher_id)
+            trained += 1
 
-        self._trained = trained_count > 0
         print(
             f"[PreferenceModel] Training complete — "
-            f"{trained_count} teacher model(s) ready."
+            f"{trained} ML models ready, {skipped} using heuristic fallback."
         )
 
-    def predict_acceptance(self, teacher_id, day, time_slot, course, group_size, booked_today):
+    def predict_acceptance(
+        self,
+        teacher_id: int,
+        day: str,
+        time_slot: str,
+        course: dict,
+        group_size: int,
+        booked_today: int,
+    ) -> float:
         """
-        Predict the probability that teacher_id will accept (day, time_slot).
+        Predict P(teacher accepts (day, slot)).
 
         Returns float in [0.0, 1.0].
-        Falls back to a heuristic if no model is available.
+        Uses ML model when available; logs whether ML or heuristic was used.
         """
         key = str(teacher_id)
 
         if SKLEARN_AVAILABLE and key in self._models:
             features = encode_features(day, time_slot, course, group_size, booked_today)
-            prob = self._models[key].predict_proba([features])[0]
-            # prob is [P(rejected), P(accepted)] — return P(accepted)
-            classes = list(self._models[key].classes_)
-            if 1 in classes:
-                return float(prob[classes.index(1)])
-            return 0.5
+            proba    = self._models[key].predict_proba([features])[0]
+            classes  = list(self._models[key].classes_)
+            return float(proba[classes.index(1)]) if 1 in classes else 0.5
 
-        # ── Rule-based fallback ──────────────────────────────────────────────
-        return self._rule_based_score(day, time_slot)
+        # Heuristic fallback
+        return self._heuristic_score(day, time_slot)
 
-    def _rule_based_score(self, day, time_slot):
+    def _heuristic_score(self, day: str, time_slot: str) -> float:
         """
-        Simple heuristic: mid-week morning slots score highest.
-        Used when no ML model is trained yet.
+        Simple day × slot heuristic. Used when no ML model exists.
+        Scores are defined in config.HEURISTIC_DAY_SCORES and
+        config.HEURISTIC_SLOT_SCORES.
         """
-        day_scores  = {"Monday": 0.7, "Tuesday": 0.9, "Wednesday": 1.0,
-                       "Thursday": 0.9, "Friday": 0.6}
-        slot_scores = {
-            "08:00-10:00": 0.7,
-            "10:00-12:00": 1.0,
-            "12:00-14:00": 0.5,
-            "14:00-16:00": 0.8,
-            "16:00-18:00": 0.6,
-        }
-        d = day_scores.get(day, 0.5)
-        s = slot_scores.get(time_slot, 0.5)
+        d = HEURISTIC_DAY_SCORES.get(day, 0.5)
+        s = HEURISTIC_SLOT_SCORES.get(time_slot, 0.5)
         return round((d + s) / 2, 4)
 
-    def rank_slots(self, teacher_agent, course, group_size, booked_per_day):
+    def rank_slots(
+        self,
+        teacher_agent,
+        course: dict,
+        group_size: int,
+        booked_per_day: dict[str, int],
+    ) -> list[tuple[str, str, float]]:
         """
-        Rank all available (day, slot) pairs for a teacher by predicted acceptance.
+        Rank all free (day, slot) pairs for a teacher by predicted acceptance.
 
         Parameters
         ----------
-        teacher_agent : TeacherAgent
-        course        : dict
-        group_size    : int
-        booked_per_day: dict { day -> int }  sessions already booked that day
+        teacher_agent  : TeacherAgent
+        course         : dict
+        group_size     : int
+        booked_per_day : { day -> sessions_already_booked }
 
         Returns
         -------
-        list[tuple[str, str, float]]
-            Sorted [(day, slot, score), ...] highest first — only free slots.
+        list[(day, slot, score)] sorted highest-score first.
+        Only includes slots where teacher is currently available.
         """
-        ranked = []
-        for day in DAYS:
+        ranked: list[tuple[str, str, float]] = []
+
+        for day in teacher_agent.available_days:
             booked_today = booked_per_day.get(day, 0)
             for slot in TIME_SLOTS:
                 if not teacher_agent.is_available(day, slot):
                     continue
                 score = self.predict_acceptance(
                     teacher_agent.teacher_id,
-                    day, slot, course, group_size, booked_today
+                    day, slot, course, group_size, booked_today,
                 )
                 ranked.append((day, slot, score))
 
         ranked.sort(key=lambda x: x[2], reverse=True)
         return ranked
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience: seed synthetic history for demo purposes
-# ─────────────────────────────────────────────────────────────────────────────
-
-def seed_synthetic_history(teachers, num_records=20):
-    """
-    Generate synthetic scheduling history so the ML model has something
-    to train on from the very first run.
-
-    Simulates that teachers strongly prefer their declared preferred_time.
-    Call this once from utils.load_sample_data() or manually.
-    """
-    import random
-    random.seed(42)
-
-    history = load_history()
-
-    for t in teachers:
-        key     = str(t["teacher_id"])
-        avail   = [d.strip() for d in t["available_days"].split(",")]
-        pref    = t["preferred_time"]
-        pref_slots = TIME_SLOTS[:3] if pref == "Morning" else TIME_SLOTS[2:]
-        other_slots = [s for s in TIME_SLOTS if s not in pref_slots]
-
-        records = history.get(key, [])
-
-        for _ in range(num_records):
-            day  = random.choice(avail)
-            # 70% chance of preferred slot
-            slot = (random.choice(pref_slots)
-                    if random.random() < 0.7
-                    else random.choice(other_slots))
-            accepted = 1 if slot in pref_slots else (1 if random.random() < 0.3 else 0)
-            booked   = random.randint(0, 2)
-            size     = random.randint(20, 40)
-            ctype    = random.choice(["Standard", "Lab", "Lecture Hall"])
-
-            records.append({
-                "day":          day,
-                "time_slot":    slot,
-                "course_type":  ctype,
-                "group_size":   size,
-                "booked_today": booked,
-                "accepted":     accepted,
-            })
-
-        history[key] = records
-
-    save_history(history)
-    print(f"[PreferenceModel] Seeded history for {len(teachers)} teacher(s).")
-
-
-# ── Quick test ────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    from database import init_db, get_all_teachers
-    from utils import load_sample_data
-
-    init_db()
-    load_sample_data()
-    teachers = get_all_teachers()
-
-    seed_synthetic_history(teachers)
-
-    pm = PreferenceModel()
-    pm.train()
-
-    # Show top-3 ranked slots for teacher 1
-    from agents import TeacherAgent
-    class FakeModel: pass
-    t_data  = teachers[0]
-    t_agent = TeacherAgent(1, FakeModel(), t_data)
-
-    course = {"required_room_type": "Standard"}
-    ranked = pm.rank_slots(t_agent, course, 30, {})
-    print(f"\nTop-3 slots for {t_data['name']}:")
-    for day, slot, score in ranked[:3]:
-        print(f"  {day} {slot}  score={score:.4f}")
