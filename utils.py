@@ -23,7 +23,6 @@ DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 TIME_SLOTS = [
     "08:30-10:00",
     "10:15-11:45",
-    "12:00-13:30",
     "13:00-14:30",
     "14:45-16:15",
     "16:15-18:00",
