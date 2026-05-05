@@ -240,5 +240,6 @@ def clear_schedule():
     deleted = cursor.rowcount # Tells you how many rows were deleted.
     conn.close()
     print(f"[DB] Schedule cleared: {deleted} session(s) removed.")
+    return deleted
 
     
