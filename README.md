@@ -167,10 +167,10 @@ scikit-learn
 
 | Name | Role |
 |---|---|
-| — | MAS & Agent Design |
-| — | Database & Backend |
-| — | Web Interface & Dashboard |
-| — | Report & Documentation |
+| Rafeh Maddouri | MAS & Agent Design |
+| Rafeh Maddouri | Database & Backend |
+| Rafeh Maddouri | Web Interface & Dashboard |
+| Rafeh Maddouri | Report & Documentation |
 
 ---
 
